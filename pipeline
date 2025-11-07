@@ -1,0 +1,154 @@
+pipeline {
+  agent any
+
+  environment {
+    // Must be in 30000–32767 range for NodePort
+    NODE_PORT = '30085'
+    K8S_NAMESPACE = 'default'
+    LOCAL_BIN = "${env.WORKSPACE}/bin"
+    PATH = "${env.WORKSPACE}/bin:${env.PATH}"
+  }
+
+  stages {
+    stage('Prep kubectl') {
+      steps {
+        sh '''
+          set -eux
+          mkdir -p "${LOCAL_BIN}"
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            echo "Installing kubectl to ${LOCAL_BIN}..."
+            cd /tmp
+            KVER=$(curl -sL https://dl.k8s.io/release/stable.txt)
+            curl -fsSLo kubectl "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
+            chmod +x kubectl
+            mv kubectl "${LOCAL_BIN}/kubectl"
+          fi
+
+          kubectl version --client
+        '''
+      }
+    }
+
+    stage('Verify kube access') {
+      steps {
+        withCredentials([file(credentialsId: 'k8s-config', variable: 'KCFG')]) {
+          sh '''
+            set -eux
+            export KUBECONFIG="$KCFG"
+
+            echo "== Contexts ==";        kubectl config get-contexts || true
+            echo "== Current context =="; kubectl config current-context || true
+            echo "== Nodes ==";           kubectl get nodes -o wide
+            kubectl get ns
+          '''
+        }
+      }
+    }
+
+    stage('Deploy: hello-http Deployment') {
+      steps {
+        withCredentials([file(credentialsId: 'k8s-config', variable: 'KCFG')]) {
+          sh '''
+            set -eux
+            export KUBECONFIG="$KCFG"
+
+            # Ensure namespace exists
+            kubectl get ns "${K8S_NAMESPACE}" >/dev/null 2>&1 || kubectl create ns "${K8S_NAMESPACE}"
+
+            # Separate heredoc for the Deployment (NO quotes on EOF so env expands if needed)
+            kubectl -n "${K8S_NAMESPACE}" apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-http
+  labels:
+    app: hello-http
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hello-http
+  template:
+    metadata:
+      labels:
+        app: hello-http
+    spec:
+      containers:
+        - name: http-echo
+          image: hashicorp/http-echo:0.2.3
+          args:
+            - "-text=Hello from Kubernetes via Jenkins!"
+            - "-listen=:8080"
+          ports:
+            - containerPort: 8080
+EOF
+
+            kubectl -n "${K8S_NAMESPACE}" rollout status deployment/hello-http --timeout=120s
+          '''
+        }
+      }
+    }
+
+    stage('Deploy: Service (NodePort)') {
+      steps {
+        withCredentials([file(credentialsId: 'k8s-config', variable: 'KCFG')]) {
+          sh '''
+            set -eux
+            export KUBECONFIG="$KCFG"
+
+            # Separate heredoc for the Service (ensures clean YAML; ${NODE_PORT} expands)
+            kubectl -n "${K8S_NAMESPACE}" apply -f - <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello-http-svc
+  labels:
+    app: hello-http
+spec:
+  type: NodePort
+  selector:
+    app: hello-http
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      nodePort: ${NODE_PORT}
+EOF
+          '''
+        }
+      }
+    }
+
+    stage('Show Access URL') {
+      steps {
+        withCredentials([file(credentialsId: 'k8s-config', variable: 'KCFG')]) {
+          sh '''
+            set -eux
+            export KUBECONFIG="$KCFG"
+
+            NP=$(kubectl -n "${K8S_NAMESPACE}" get svc hello-http-svc -o jsonpath="{.spec.ports[0].nodePort}")
+            # Prefer ExternalIP; fallback InternalIP
+            NODE_IP=$(kubectl get nodes -o jsonpath="{.items[0].status.addresses[?(@.type=='ExternalIP')].address}")
+            [ -n "$NODE_IP" ] || NODE_IP=$(kubectl get nodes -o jsonpath="{.items[0].status.addresses[?(@.type=='InternalIP')].address}")
+
+            echo ""
+            echo "================= ACCESS INFO ================="
+            echo "URL: http://${NODE_IP}:${NP}"
+            echo "Service:"
+            kubectl -n "${K8S_NAMESPACE}" get svc hello-http-svc -o wide
+            echo "Pods:"
+            kubectl -n "${K8S_NAMESPACE}" get pods -l app=hello-http -o wide
+            echo "==============================================="
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      echo 'Done.'
+    }
+  }
+}
