@@ -1,0 +1,26 @@
+1. Prep: give Jenkins kubectl access to your cluster
+  Install kubectl in jenkins master agent
+
+2.Add the kubeconfig to Jenkins Credentials
+
+Jenkins → Manage Jenkins → Credentials → System → Global → Add Credentials
+
+Kind: Secret file → upload your kubeconfig file
+
+ID: kubeconfig-k8s (use exactly this ID to match the pipeline below)
+
+3. How to get kubeconfig file 
+
+   Login your K8s cluster master node 
+
+   Run -> cat ~/.kube/config
+
+   copy the file content and save it in text file
+
+   upload the file in jenkins credentials
+   
+4. Create a Pipeline job in Jenkins
+
+New Item → Pipeline → name: k8s-hello-world → OK.
+
+In Pipeline → Definition: Pipeline script → paste the Jenkinsfile below → Save → Build Now.
